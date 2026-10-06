@@ -1,6 +1,6 @@
 {
   "name": "pi-ninfer-video",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "pi extension: read a local video via a video-capable model, inheriting pi's current provider's endpoint and API key (e.g. a local ninfer). Zero dependencies.",
   "license": "MIT",
   "keywords": [

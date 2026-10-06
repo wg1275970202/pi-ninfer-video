@@ -1,134 +1,255 @@
-// pi-ninfer-video — read a local video via a video-capable OpenAI-compat endpoint.
-// Endpoint + api key follow pi's CURRENT provider (PI_PROVIDER, read from
-// models.json) so nothing is hardcoded. Env vars override for explicit control:
-//   READ_VIDEO_BASE_URL / READ_VIDEO_MODEL / READ_VIDEO_API_KEY
-// Zero npm deps: Node built-in fs/os/path + global fetch.
-
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ImageContent, TextContent, ToolDefinition } from "@mariozechner/pi-ai";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const MAX_BYTES = 200 * 1024 * 1024;
+const EXTENSION_NAME = "pi-ninfer-video";
+const MAX_BYTES = 48 * 1024 * 1024; // 48 MB base64 cap
 
-function agentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+const MIME_BY_EXT: Record<string, string> = {
+  ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
+  ".webm": "video/webm",
+  ".mkv": "video/x-matroska",
+  ".avi": "video/x-msvideo",
+  ".m4v": "video/mp4",
+};
+
+function resolveMime(name: string): string {
+  const ext = path.extname(name).toLowerCase();
+  return MIME_BY_EXT[ext] ?? "video/mp4";
 }
 
-// Resolve base url + api key from pi's current provider (PI_PROVIDER).
-function currentProvider(): { baseUrl?: string; apiKey?: string } {
-  const provider = process.env.PI_PROVIDER;
-  if (!provider) return {};
+type ModelsJson = {
+  defaultProvider?: string;
+  providers?: Record<string, { baseUrl?: string; apiKey?: string }>;
+};
+
+function readModelsJson(): ModelsJson | undefined {
   try {
-    const raw = fs.readFileSync(path.join(agentDir(), "models.json"), "utf8");
-    const cfg = JSON.parse(raw)?.providers?.[provider];
-    return { baseUrl: cfg?.baseUrl, apiKey: cfg?.apiKey };
+    const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+    const mf = path.join(agentDir, "models.json");
+    const parsed = JSON.parse(fs.readFileSync(mf, "utf-8")) as ModelsJson;
+    if (parsed && typeof parsed === "object") return parsed;
+    return undefined;
   } catch {
-    return {};
+    return undefined;
   }
 }
 
-function resolve() {
-  const pc = currentProvider();
+// defaultProvider / defaultModel live in settings.json (NOT models.json).
+function readSettings(): { defaultProvider?: string; defaultModel?: string } | undefined {
+  try {
+    const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+    const sf = path.join(agentDir, "settings.json");
+    const d = JSON.parse(fs.readFileSync(sf, "utf-8"));
+    return d && typeof d === "object" ? d : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readDefaultProvider(): string | undefined {
+  return readSettings()?.defaultProvider;
+}
+
+// Fallback only: read the current provider (PI_PROVIDER or defaultProvider) from models.json.
+function currentProvider(): { baseUrl?: string; apiKey?: string } | undefined {
+  const name = process.env.PI_PROVIDER || readDefaultProvider();
+  if (!name) return undefined;
+  const p = readModelsJson()?.providers?.[name];
+  return p ? { baseUrl: p.baseUrl, apiKey: p.apiKey } : undefined;
+}
+
+// Endpoint resolution, in priority order:
+//   env override  >  pi-injected ctx.model.config  >  pi getApiKeyAndHeaders  >  models.json
+// pi injects the active provider's config into the extension context; the env
+// PI_PROVIDER is NOT available at extension runtime, so ctx is the primary source.
+async function resolveEndpoint(ctx: any): Promise<{ baseUrl?: string; apiKey?: string; model?: string }> {
+  const cfg = (ctx?.model?.config as any) ?? {};
+  const envBase = process.env.READ_VIDEO_BASE_URL;
+  const envKey = process.env.READ_VIDEO_API_KEY;
+  const envModel = process.env.READ_VIDEO_MODEL;
+  const inherited = currentProvider();
+
+  const baseUrl = envBase || (typeof cfg.baseUrl === "string" && cfg.baseUrl) || inherited?.baseUrl;
+  let apiKey = envKey || (typeof cfg.apiKey === "string" && cfg.apiKey) || inherited?.apiKey;
+  if (!apiKey && typeof ctx?.getApiKeyAndHeaders === "function") {
+    try {
+      const r = await ctx.getApiKeyAndHeaders(ctx.model?.provider);
+      apiKey = (typeof r?.apiKey === "string" && r.apiKey) || undefined;
+    } catch {
+      /* ignore */
+    }
+  }
+  const settings = readSettings();
+  const model =
+    envModel ||
+    (typeof ctx?.model?.id === "string" ? ctx.model.id : undefined) ||
+    settings?.defaultModel ||
+    process.env.PI_MODEL ||
+    undefined;
+
+  return { baseUrl, apiKey, model };
+}
+
+function buildError(kind: "no_endpoint" | "bad_response" | "other", detail?: string) {
+  const msg =
+    kind === "no_endpoint"
+      ? `${EXTENSION_NAME}: could not resolve a video endpoint. Check your pi provider exposes baseUrl/apiKey (ctx.model.config / getApiKeyAndHeaders), or set READ_VIDEO_BASE_URL / READ_VIDEO_API_KEY / READ_VIDEO_MODEL. (diag: ~/.pi/read-video-diag.json)`
+      : kind === "bad_response"
+        ? `${EXTENSION_NAME}: provider returned an unusable response. ${detail ?? ""}`.trim()
+        : `${EXTENSION_NAME}: ${detail ?? "unknown error"}`;
   return {
-    baseUrl: (process.env.READ_VIDEO_BASE_URL || pc.baseUrl || "").replace(/\/$/, ""),
-    model: process.env.READ_VIDEO_MODEL || process.env.PI_MODEL || "",
-    apiKey: process.env.READ_VIDEO_API_KEY || pc.apiKey || "",
-    provider: process.env.PI_PROVIDER || "(none)",
+    content: [{ type: "text" as const, text: msg }],
+    details: { error: { kind, message: msg } },
   };
 }
 
-function mimeFor(p: string): string {
-  const e = p.toLowerCase();
-  if (e.endsWith(".mov") || e.endsWith(".qt")) return "video/quicktime";
-  if (e.endsWith(".mkv")) return "video/x-matroska";
-  if (e.endsWith(".webm")) return "video/webm";
-  if (e.endsWith(".avi")) return "video/x-msvideo";
-  return "video/mp4";
+function writeDiag(ctx: any, baseUrl?: string, apiKey?: string, model?: string) {
+  try {
+    const p = path.join(os.homedir(), ".pi", "read-video-diag.json");
+    fs.writeFileSync(
+      p,
+      JSON.stringify(
+        {
+          ts: new Date().toISOString(),
+          baseUrl,
+          hasKey: !!apiKey,
+          model,
+          model_id: ctx?.model?.id,
+          model_provider: ctx?.model?.provider,
+          model_keys: ctx?.model ? Object.keys(ctx.model) : null,
+          model_config: ctx?.model?.config ?? null,
+          model_config_keys: ctx?.model?.config ? Object.keys(ctx.model.config) : null,
+          has_getApiKeyAndHeaders: typeof ctx?.getApiKeyAndHeaders,
+          env_PI_PROVIDER: process.env.PI_PROVIDER,
+          env_PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+        },
+        null,
+        2
+      )
+    );
+  } catch {
+    /* ignore */
+  }
 }
 
-export default function (pi: any) {
-  pi.registerTool({
+export default function (pi: ExtensionAPI) {
+  const tool: ToolDefinition<"video", { video: string; question?: string }> = {
     name: "read_video",
-    label: "Read Video",
+    label: "Read video",
+    display: true,
     description:
-      "Read a local video file. Sends it (base64 video_url) to the video-capable model on pi's current provider endpoint and returns its description / transcription.",
-    promptSnippet: "Send a local video to the current provider's video model and get a description",
-    promptGuidelines: [
-      "Use read_video when the user asks to read, describe, or transcribe a local video file.",
-      "Pass the absolute path of the video in `video`; an optional `question` focuses the answer.",
-    ],
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      "Read a local video file. Sends it (base64 video_url) to a video-capable " +
+      "OpenAI-compatible model endpoint and returns the model's description / transcription. " +
+      "Endpoint, key and model default to pi's current provider (ctx.model.config), " +
+      "so a local endpoint like ninfer works automatically. " +
+      "Override with READ_VIDEO_BASE_URL / READ_VIDEO_MODEL / READ_VIDEO_API_KEY.",
     parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        video: { type: "string", description: "Absolute path to the local video file (.mov/.mp4/.mkv/...)" },
-        question: { type: "string", description: "Optional question to focus the answer. Omit for a full description." },
+      video: {
+        type: "string",
+        description: "Absolute path to the local video file (.mov/.mp4/.mkv/...)",
       },
-      required: ["video"],
+      question: {
+        type: "string",
+        description: "Optional question to focus the answer. Omit for a full description.",
+      },
     },
-    execute: async (_toolCallId: string, params: any) => {
-      const { baseUrl, model, apiKey, provider } = resolve();
-      if (!baseUrl || !apiKey || !model) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `pi-ninfer-video: could not resolve a video endpoint. pi provider=${provider} (check it has baseUrl+apiKey in models.json), or set READ_VIDEO_BASE_URL / READ_VIDEO_API_KEY / READ_VIDEO_MODEL.`,
-            },
-          ],
-          isError: true,
-        };
+    async execute(_id, args, ctx, _signal, _onUpdate) {
+      const video = (args as any)?.video;
+      const prompt = (args as any)?.question;
+      if (!video || typeof video !== "string") {
+        return buildError("other", 'missing required arg "video" (absolute path)');
       }
-      const video: string = params?.video;
-      if (!video || !fs.existsSync(video)) {
-        return { content: [{ type: "text" as const, text: `Error: video file not found: ${video}` }], isError: true };
+      const abs = path.resolve(video);
+      if (!fs.existsSync(abs)) {
+        return buildError("other", `video file not found: ${abs}`);
       }
-      const size = fs.statSync(video).size;
-      if (size > MAX_BYTES) {
-        return {
-          content: [{ type: "text" as const, text: `Error: video too large (${(size / 1048576).toFixed(1)} MB > 200 MB limit).` }],
-          isError: true,
-        };
+      const st = fs.statSync(abs);
+      if (!st.isFile()) {
+        return buildError("other", `not a file: ${abs}`);
       }
-      const b64 = fs.readFileSync(video, "base64");
-      const uri = `data:${mimeFor(video)};base64,${b64}`;
-      const question: string =
-        params?.question || "详细描述这段视频：主体物体、场景、任何动作/变化/闪烁、以及画面上的文字。";
+      if (st.size > MAX_BYTES) {
+        return buildError("other", `video too large (${(st.size / 1024 / 1024).toFixed(1)} MB > ${MAX_BYTES / 1024 / 1024} MB limit)`);
+      }
+
+      const { baseUrl, apiKey, model } = await resolveEndpoint(ctx);
+      if (!baseUrl || !apiKey) {
+        writeDiag(ctx, baseUrl, apiKey, model);
+        return buildError("no_endpoint");
+      }
+      if (!model) {
+        return buildError("no_endpoint", "no model id resolvable (set READ_VIDEO_MODEL)");
+      }
+
+      const mime = resolveMime(abs);
+      const b64 = fs.readFileSync(abs).toString("base64");
+      const promptText = prompt && prompt.trim() ? prompt.trim() : "Describe this video in detail.";
+      const url = baseUrl.replace(/\/+$/, "") + "/chat/completions";
+
+      let resp: Response;
       try {
-        const res = await fetch(`${baseUrl}/chat/completions`, {
+        resp = await fetch(url, {
           method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
           body: JSON.stringify({
             model,
             messages: [
               {
                 role: "user",
-                content: [{ type: "text", text: question }, { type: "video_url", video_url: { url: uri } }],
+                content: [
+                  { type: "video_url", video_url: { url: `data:${mime};base64,${b64}` } },
+                  { type: "text", text: promptText },
+                ],
               },
             ],
           }),
         });
-        if (!res.ok) {
-          const txt = await res.text();
-          return {
-            content: [{ type: "text" as const, text: `Model endpoint error (HTTP ${res.status}): ${txt.slice(0, 2000)}` }],
-            isError: true,
-          };
-        }
-        const data: any = await res.json();
-        const text = data?.choices?.[0]?.message?.content ?? "(empty response)";
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `--- read_video: ${video} · provider=${provider} · model=${model} · ${(size / 1048576).toFixed(1)} MB ---\n${text}`,
-            },
-          ],
-        };
-      } catch (e: any) {
-        return { content: [{ type: "text" as const, text: `Error calling model: ${e?.message || e}` }], isError: true };
+      } catch (e) {
+        return buildError("other", `fetch failed: ${(e as Error).message ?? String(e)}`);
       }
+
+      const text = await resp.text();
+      if (!resp.ok) {
+        const snippet = text.length > 400 ? text.slice(0, 400) + "…" : text;
+        return buildError("other", `provider HTTP ${resp.status}: ${snippet}`);
+      }
+      let data: any;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        return buildError("bad_response", `response is not JSON: ${(e as Error).message ?? String(e)}`);
+      }
+
+      const choice = data?.choices?.[0];
+      let answer: unknown = choice?.message?.content ?? choice?.delta?.content ?? data?.message?.content ?? data?.content;
+      if (Array.isArray(answer)) {
+        answer = (answer as any[])
+          .map((p) => (typeof p === "string" ? p : (p as any)?.text ?? ""))
+          .join("\n")
+          .trim();
+      }
+      if (typeof answer !== "string" || !answer.trim()) {
+        const snippet = text.length > 400 ? text.slice(0, 400) + "…" : text;
+        return buildError("bad_response", `no text content in response: ${snippet}`);
+      }
+
+      const out: (TextContent | ImageContent)[] = [{ type: "text", text: answer.trim() }];
+      if (Array.isArray(data?.message?.images)) {
+        for (const im of data.message.images) {
+          if (im?.type === "data" && im?.data && im?.mime) {
+            out.push({ type: "image", data: im.data, mimeType: im.mime });
+          }
+        }
+      }
+      return { content: out, details: { model, bytes: st.size } };
     },
-  });
+  };
+
+  pi.registerTool(tool);
 }
