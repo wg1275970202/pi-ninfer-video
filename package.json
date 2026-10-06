@@ -1,0 +1,29 @@
+{
+  "name": "pi-ninfer-video",
+  "version": "0.1.0",
+  "description": "pi extension: read a local video via a video-capable model, inheriting pi's current provider's endpoint and API key (e.g. a local ninfer). Zero dependencies.",
+  "license": "MIT",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "video",
+    "vision",
+    "ninfer",
+    "openai-compatible",
+    "local"
+  ],
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wg1275970202/pi-ninfer-video"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/read-video.ts"
+    ]
+  }
+}
